@@ -6,7 +6,7 @@ from diffusers.optimization import get_scheduler
 import json
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from .diff_policy import DiffusionPolicy
+from diff_policy import DiffusionPolicy
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from utils import mat_to_pose9d
 
