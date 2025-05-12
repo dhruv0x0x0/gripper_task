@@ -124,8 +124,8 @@ class SimModelRunner:
             'image': img_np
         }
     @torch.no_grad()
-    def step(self,j):
-        if 1:
+    def step(self,j, play_rec):
+        if play_rec:
             for i in range(16):
                 action = self.actions[j*16+i]
                 print(action)
@@ -156,6 +156,7 @@ def main():
     parser.add_argument('--json_path', type=str, default='raw_data/bottle_rows/2025_03_04_13_51_38_PickAnything.json')
     parser.add_argument('--episode', type=int, default=2)
     parser.add_argument('--max_steps', type=int, default=100)
+    parser.add_argument('--play_recorded', type=int, default=0)
     args = parser.parse_args()
 
     # load JSON and create env with rgb_array output
@@ -176,7 +177,7 @@ def main():
     runner = SimModelRunner(actions, ori_env, initial_pose, device)
 
     for step in range(args.max_steps):
-        runner.step(j=step)
+        runner.step(j=step, play_rec=args.play_recorded)
     
     all_actions = np.stack(action_list, axis=0)   # shape: [T, action_dim]
     np.save("actions.npy", all_actions)
