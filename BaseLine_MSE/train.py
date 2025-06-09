@@ -119,7 +119,7 @@ if  __name__== '__main__':
     optimizer = optim.AdamW(diff_policy.model.parameters(), lr=1e-4, weight_decay=1e-3, betas=[0.9,0.95])
     batch_size = 64
     epochs = 50
-    tokeniser_path = "saved_processor" 
+    #tokeniser_path = "saved_processor" 
     print('loading_dataset')
     ds = ManiSkillSequenceDataset('out_dataset_bottle', transform=transforms.ToTensor())
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)

@@ -76,7 +76,7 @@ def get_action(offset_pose: np.ndarray=np.eye(4), gripper_state: float=1) -> np.
 
 
 class SimModelRunner:
-    def __init__(self, actions, env: gym.Env, initial_pose: np.ndarray, device, writer=None):
+    def __init__(self, s, actions, env: gym.Env, initial_pose: np.ndarray, device, writer=None):
         self.env = env
         self.initial_pose = initial_pose
         self.device = device
@@ -84,18 +84,23 @@ class SimModelRunner:
         self.writer = writer
 
         # warm up steps
-        for i in range(50):
-            obs, _, _, _, _ = self.env.step(get_action())
-        
+        # for i in range(50):
+        #     obs, _, _, _, _ = self.env.step(get_action())
         self.buffer = StateQueue_dict(k=2)
-        self.env.step(get_action())
-        self.buffer.update(self.get_current_obs())
-        self.env.step(get_action())
-        self.buffer.update(self.get_current_obs())
+        for i in range(100):
+            #self.env.step(get_action())
+            self.env.set_state_dict(s[i])
+            self.env.render()
+            self.buffer.update(self.get_current_obs())
+        #self.env.step(get_action())
+
+        # self.env.set_state_dict(s[2])
+        # self.env.render()
+        # self.buffer.update(self.get_current_obs())
 
         self.preprocess = transforms.Compose([transforms.ToTensor()])
         scheduler = DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
-        self.diff_policy = DiffusionPolicy(noise_scheduler=scheduler, load_path='modeltry_ema_epoch8.pt')
+        self.diff_policy = DiffusionPolicy(noise_scheduler=scheduler, load_path='modeltry_ema_epoch14.pt')
 
     def get_current_obs(self):
         img_np, relT, grip = get_relevant_info(self.env, self.initial_pose)
@@ -129,14 +134,14 @@ class SimModelRunner:
             gripper = next_action[:, 9:]
             
             for i in range(16):
-                action = get_action(poses[i], gripper[i])
+                action = get_action(poses[i], 2*(gripper[i]-0.55))
                 print(action)
                 action_list.append(action)
                 obs, _, _, _, info = self.env.step(action)
                 frame = self.env.render()
                 frame = frame[0]
                 if self.writer:
-                    self.writer.write(cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR))
+                    self.writer.write(cv2.cvtColor(frame.cpu().numpy(), cv2.COLOR_RGB2BGR))
                 self.buffer.update(self.get_current_obs())
 
         return None
@@ -144,23 +149,31 @@ class SimModelRunner:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--json_path', type=str, default='raw_data/bottle_rows/2025_03_04_13_51_38_PickAnything.json')
-    parser.add_argument('--episode', type=int, default=2)
-    parser.add_argument('--max_steps', type=int, default=100)
+    parser.add_argument('--h5_path', type=str, default="monster_row_wise/2025_02_28_18_27_44_PickAnything.h5")
+    parser.add_argument('--episode', type=int, default=10)
+    parser.add_argument('--max_steps', type=int, default=40)
     parser.add_argument('--play_recorded', type=int, default=0)
+
     args = parser.parse_args()
 
-    # load JSON and create env with rgb_array output
-    json_data = io_utils.load_json(args.json_path)
-    json_data['env_info']["env_kwargs"]['show_goal_site'] = False
+    traj_path = args.h5_path
+    ori_h5_file = h5py.File(traj_path, "r")
+    json_path = traj_path.replace(".h5", ".json")
+    json_data = io_utils.load_json(json_path)
+    json_data['env_info']["env_kwargs"]['show_goal_site']= False
     env_info = json_data["env_info"]
+    print(env_info)
     env_id = env_info["env_id"]
     ori_env_kwargs = env_info["env_kwargs"]
-    #if not args.play_recorded:
     ori_env_kwargs['render_mode'] = 'rgb_array'
     ori_env = gym.make(env_id, **ori_env_kwargs)
     ori_env.reset(**json_data['episodes'][args.episode]['reset_kwargs'])
-
+    ori_env_states = trajectory_utils.dict_to_list_of_dicts(
+                    ori_h5_file[f"traj_{args.episode}"]["env_states"]
+                    )
+    ori_env.set_state_dict(ori_env_states[0])
+    ori_env.render()
+    
     # ——— VIDEO RECORDER SETUP ———
     first_rgb = ori_env.render()
     #print(first_rgb.shape)
@@ -181,10 +194,10 @@ def main():
         ],
         dtype=np.float32
     )
-    first_frame, _, _ = get_relevant_info(ori_env=ori_env, initial_pose=initial_pose)
+    #first_frame, _, _ = get_relevant_info(ori_env=ori_env, initial_pose=initial_pose)
     actions = np.load('actions.npy')
 
-    runner = SimModelRunner(actions, ori_env, initial_pose, device, writer)
+    runner = SimModelRunner(ori_env_states, actions, ori_env, initial_pose, device, writer)
 
     for step in range(args.max_steps):
         runner.step(j=step, play_rec=args.play_recorded)

@@ -258,6 +258,13 @@ def pose9d_to_mat(d10):
     out[...,3,3] = 1
     return out
 
+import os
+import json
+import numpy as np
+import torch
+from scipy.fft import dct, idct
+import matplotlib.pyplot as plt
+
 class TemporalBPEProcessor:
     def __init__(
         self,
@@ -336,7 +343,7 @@ class TemporalBPEProcessor:
 
         tokens: list[list[int]] = []
         for b in range(batch_size):
-            flat = (q[b].flatten() - self.min_token).clip(min=0).clip(max=vocab)
+            flat = (q[b].flatten() - self.min_token).clip(min=0).clip(max=200)
             tokens.append(flat.tolist())
 
         return torch.tensor(tokens)+1
@@ -389,7 +396,7 @@ class TemporalBPEProcessor:
         
         pose_seqs = np.concatenate(pose_seqs, axis=0)
         grip_seqs = np.concatenate(grip_seqs, axis=0)
-        pose_seqs = mat_to_pose10d(pose_seqs.reshape(-1,4,4))
+        pose_seqs = mat_to_pose9d(pose_seqs.reshape(-1,4,4))
         all_states = np.concatenate([pose_seqs, grip_seqs], axis= -1)
         print(len(all_states))
         mean = all_states.mean(axis=0)
@@ -480,3 +487,9 @@ class TemporalBPEProcessor:
         plt.ylabel("Count")
         plt.grid(True)
         plt.show()
+
+def train_tokeniser(data_dir: str = 'out_dataset_bottle', T=16):
+    processor = TemporalBPEProcessor.fit_from_npz(
+        data_dir, num_episodes=-1, scale=10, normalization="zscore", T=T
+    )
+    processor.save("saved_processor")

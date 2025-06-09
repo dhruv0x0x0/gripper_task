@@ -10,274 +10,8 @@ import numpy as np
 import torch
 from scipy.fft import dct, idct
 import matplotlib.pyplot as plt
-vocab = 199
+
 np.set_printoptions(precision=3, suppress=True)
-def normalize(vec, eps=1e-12):
-    norm = np.linalg.norm(vec, axis=-1)
-    norm = np.maximum(norm, eps)
-    out = (vec.T / norm).T
-    return out
-
-def rot6d_to_mat(d6):
-    a1, a2 = d6[..., :3], d6[..., 3:]
-    b1 = normalize(a1)
-    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    b2 = normalize(b2)
-    b3 = np.cross(b1, b2, axis=-1)
-    out = np.stack((b1, b2, b3), axis=-2)
-    return out
-
-def mat_to_rot6d(mat):
-    batch_dim = mat.shape[:-2]
-    out = mat[..., :2, :].copy().reshape(batch_dim + (6,))
-    return out
-
-def mat_to_pose10d(mat):
-    pos = mat[...,:3,3]
-    rotmat = mat[...,:3,:3]
-    d6 = mat_to_rot6d(rotmat)
-    d10 = np.concatenate([pos, d6], axis=-1)
-    return d10
-
-def pose10d_to_mat(d10):
-    pos = d10[...,:3]
-    d6 = d10[...,3:]
-    rotmat = rot6d_to_mat(d6)
-    out = np.zeros(d10.shape[:-1]+(4,4), dtype=d10.dtype)
-    out[...,:3,:3] = rotmat
-    out[...,:3,3] = pos
-    out[...,3,3] = 1
-    return out
-class TemporalBPEProcessor:
-    def __init__(
-        self,
-        scale: float = 100.0,
-        min_token: int = 0,
-        time_horizon: int | None = None,
-        state_dim: int | None = None,
-        normalization: str = "zscore",  # 'zscore' or 'minmax'
-        mean: np.ndarray | None = None,
-        std: np.ndarray | None = None,
-        min_val: np.ndarray | None = None,
-        max_val: np.ndarray | None = None,
-    ):
-        self.scale = scale
-        self.min_token = min_token
-        self.time_horizon = time_horizon
-        self.state_dim = state_dim
-        self.normalization = normalization
-        self.mean = mean
-        self.std = std
-        self.min_val = min_val
-        self.max_val = max_val
-        self.called_time_horizon = time_horizon
-        self.called_state_dim = state_dim
-        self.T = 16
-        self.mask_token_id = 0
-
-    def normalize(self, x: np.ndarray) -> np.ndarray:
-        if self.normalization == "zscore":
-            return (x - self.mean) / self.std
-        elif self.normalization == "minmax":
-            mnmx = self.max_val - self.min_val
-            mnmx[mnmx<=1e-2]= 1
-            return (x - self.min_val) / mnmx
-        return x
-
-    def _denormalize(self, x: np.ndarray) -> np.ndarray:
-        if self.normalization == "zscore":
-            return x * self.std + self.mean
-        elif self.normalization == "minmax":
-            mnmx = self.max_val - self.min_val
-            mnmx[mnmx<=1e-2]= 1
-            return x * (mnmx) + self.min_val
-        return x
-
-    def __call__(
-        self,
-        state_seq: np.ndarray,
-        padding: bool = False,
-        truncation: bool = False,
-        max_length: int | None = None,
-        return_tensors: str | None = None,
-    ):
-        """
-        Tokenize a batch of state sequences via DCT quantization.
-
-        Args:
-            state_seq: np.ndarray of shape [B, T, D] or [T, D]
-            padding: pad option (currently not used)
-            truncation: truncate option (currently not used)
-            max_length: length to pad or truncate to if return_tensors='pt'
-            return_tensors: 'pt' for PyTorch tensors
-        """
-        if state_seq.ndim == 2:
-            state_seq = state_seq[None, ...]
-        #print(state_seq.shape)
-        batch_size, T, D = state_seq.shape
-        self.called_time_horizon = T
-        self.called_state_dim = D
-
-        norm_seq = self.normalize(state_seq)
-        coeff = dct(norm_seq, axis=1, norm='ortho')
-        q = np.around(coeff * self.scale).astype(int)
-        # for i in q[0]:
-        #     print(i)
-
-        tokens: list[list[int]] = []
-        for b in range(batch_size):
-            flat = (q[b].flatten() - self.min_token).clip(min=0).clip(max=vocab)
-            tokens.append(flat.tolist())
-
-        return torch.tensor(tokens)+1
-
-    def decode(
-        self,
-        token_ids: list[list[int]],
-        state_dim: int | None = None,
-    ) -> np.ndarray:
-        D = state_dim or self.called_state_dim
-        token_ids = (token_ids-1).clip(min = 0)
-        decoded_seqs = []
-        #print('min', self.min_token)
-        for ids in token_ids:
-            arr = np.array(ids) + self.min_token
-            arr = arr.reshape(-1, D)
-            coeff = arr.astype(float) / self.scale
-            rec = idct(coeff, axis=0, norm='ortho')
-            rec = self._denormalize(rec)
-            decoded_seqs.append(rec)
-        return np.stack(decoded_seqs)
-
-    @classmethod
-    def fit_from_npz(
-        cls,
-        data_dir: str,
-        num_episodes: int = -1,
-        scale: float = 10.0,
-        normalization: str = "zscore",
-        T = 32
-    ) -> "TemporalBPEProcessor":
-        meta_path = os.path.join(data_dir, 'meta.json')
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-        episodes = meta['episodes']
-        if num_episodes == -1 or num_episodes > len(episodes):
-            num_episodes = len(episodes)
-
-        pose_seqs = []
-        grip_seqs = []
-        for ep in episodes:
-            arr = np.load(os.path.join(data_dir, ep['file']))
-            pose_seq = arr['pose']
-            grip_seq = arr['grip'][..., None]
-            # if len(seqs)==0:
-            #     seqs=np.concatenate([pose_seq, grip_seq], axis=1)
-            #x = np.concatenate([pose_seq, grip_seq], axis=1)
-            grip_seqs.append(grip_seq)
-            pose_seqs.append(pose_seq)#np.concatenate([seqs, x], axis=0)
-        
-        pose_seqs = np.concatenate(pose_seqs, axis=0)
-        grip_seqs = np.concatenate(grip_seqs, axis=0)
-        pose_seqs = mat_to_pose10d(pose_seqs.reshape(-1,4,4))
-        all_states = np.concatenate([pose_seqs, grip_seqs], axis= -1)
-        print(len(all_states))
-        mean = all_states.mean(axis=0)
-        std = all_states.std(axis=0)
-        std[std <= 1e-5] = 1.0
-        min_val = all_states.min(axis=0)
-        max_val = all_states.max(axis=0)
-        #print(all_states.shape)
-        if normalization == "zscore":
-            normed_seqs = [(s - mean) / std for s in all_states]
-        else:
-            normed_seqs = [(s - min_val) / (max_val - min_val + 1e-8) for s in all_states]
-
-        # # Determine token range without BPE
-        all_coeffs = [dct(s, axis=0, norm='ortho').flatten() for s in normed_seqs]
-        scaled_vals = np.around(np.concatenate(all_coeffs) * scale)
-        min_token = int(scaled_vals.min())
-
-        D = all_states[0].shape
-        print(scale,
-            min_token,
-            T,
-            D,
-           normalization,
-            mean,
-           std,
-            min_val,
-            max_val,)
-        print('done')
-        return cls(
-            scale=scale,
-            min_token=min_token,
-            time_horizon= T,
-            state_dim=D,
-            normalization=normalization,
-            mean=mean,
-            std=std,
-            min_val=min_val,
-            max_val=max_val,
-        )
-
-    def save(self, save_dir: str):
-        os.makedirs(save_dir, exist_ok=True)
-        np.savez(
-            os.path.join(save_dir, "normalization_stats.npz"),
-            mean=self.mean,
-            std=self.std,
-            min_val=self.min_val,
-            max_val=self.max_val,
-            scale=self.scale,
-            min_token=self.min_token,
-            time_horizon=self.called_time_horizon,
-            state_dim=self.called_state_dim,
-            normalization=self.normalization,
-        )
-
-    @classmethod
-    def load(cls, save_dir: str) -> "TemporalBPEProcessor":
-        stats = np.load(os.path.join(save_dir, "normalization_stats.npz"))
-        return cls(
-            scale=float(stats["scale"]),
-            min_token=int(stats["min_token"]),
-            time_horizon=int(stats["time_horizon"]),
-            state_dim=int(stats["state_dim"]),
-            normalization=str(stats["normalization"]),
-            mean=stats["mean"],
-            std=stats["std"],
-            min_val=stats["min_val"],
-            max_val=stats["max_val"],
-        )
-
-    def plot_coeff_histogram(self, data_dir: str, episode_index: int, bins: int = 50):
-        meta_path = os.path.join(data_dir, 'meta.json')
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-        ep = meta['episodes'][episode_index]
-        arr = np.load(os.path.join(data_dir, ep['file']))
-        pose_seq = arr['pose']
-        grip_seq = arr['grip'][..., None]
-        seq = np.concatenate([pose_seq, grip_seq], axis=1)
-
-        norm_seq = self.normalize(seq)
-        coeffs = dct(norm_seq, axis=0, norm='ortho').flatten()
-        plt.figure(figsize=(8, 4))
-        plt.hist(coeffs, bins=bins)
-        plt.title(f"Normalized DCT Coeffs Histogram — Episode {episode_index}")
-        plt.xlabel("Normalized Coefficient")
-        plt.ylabel("Count")
-        plt.grid(True)
-        plt.show()
-
-def train_tokeniser(data_dir: str = 'out_dataset_bottle', T=16):
-    processor = TemporalBPEProcessor.fit_from_npz(
-        data_dir, num_episodes=-1, scale=10, normalization="zscore", T=T
-    )
-    processor.save("saved_processor")
-
-train_tokeniser()
 
 def get_resnet(name, weights=None, **kwargs):
     """
@@ -523,6 +257,47 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+def normalize(vec, eps=1e-12):
+    norm = np.linalg.norm(vec, axis=-1)
+    norm = np.maximum(norm, eps)
+    out = (vec.T / norm).T
+    return out
+
+def rot6d_to_mat(d6):
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = normalize(a1)
+    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = normalize(b2)
+    b3 = np.cross(b1, b2, axis=-1)
+    out = np.stack((b1, b2, b3), axis=-2)
+    return out
+
+def mat_to_rot6d(mat):
+    batch_dim = mat.shape[:-2]
+    out = mat[..., :2, :].copy().reshape(batch_dim + (6,))
+    return out
+
+def mat_to_pose10d(mat):
+    pos = mat[...,:3,3]
+    rotmat = mat[...,:3,:3]
+    d6 = mat_to_rot6d(rotmat)
+    d10 = np.concatenate([pos, d6], axis=-1)
+    return d10
+
+def pose10d_to_mat(d10):
+    pos = d10[...,:3]
+    d6 = d10[...,3:]
+    rotmat = rot6d_to_mat(d6)
+    out = np.zeros(d10.shape[:-1]+(4,4), dtype=d10.dtype)
+    out[...,:3,:3] = rotmat
+    out[...,:3,3] = pos
+    out[...,3,3] = 1
+    return out
+import os
+import json
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 class ManiSkillSequenceDataset(Dataset):
     def __init__(self, data_dir: str, transform=None, state_horizon: int = 16, past_poses: int = 1):
@@ -701,7 +476,7 @@ class DiffusionTrainer2:
     def __init__(self,
                  tokeniser,
                  seq_len: int = 128,
-                 schedule_steps: int = 128,
+                 schedule_steps: int = 1000,
                  vocab_size=1000,
                  d_model=768,
                  n_heads=12,
@@ -716,52 +491,76 @@ class DiffusionTrainer2:
         self.mask_id = 1             # the token ID you want to mask out
 
         # Define your adaptive softmax here once, so it shares parameters across calls
-        self.cutoffs = [100, 250, 400]    
+        self.cutoffs = [100, 250, 400]    # example cutoffs for a 500-word vocab
         
        
         resnet = replace_bn_with_gn(get_resnet('resnet18'))
         resnet = torch.nn.Sequential(*(list(resnet.children())[:-2]))
         self.model = nn.ModuleDict({
             'vision_encoder': resnet,
-            'lldm': create_model(vocab_size=vocab, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            'lldm': create_model(vocab_size=500, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
                  cond_dim=2*512*49+2*10, num_latents=64).to(device)
         })
 
         if load_path and os.path.isfile(load_path):  # <-- Load model if specified
             print(f"Loading model from {load_path}")
             self.model.load_state_dict(torch.load(load_path, map_location=self.device))
-        for submodule in self.model.values():
-            submodule.train()
+
         self.mask_id = self.tokenizer.mask_token_id
         self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-6)
         
     def linear_noise_schedule(self, t: torch.Tensor) -> torch.Tensor:
         return (t.float() + 1) / self.T
     
-    def q_sample(self, x_start, t):
-        T = self.T
-        # Choose your schedule:
-        # p_mask = t.float() / T                      # linear
-        # p_mask = (t.float() / T)**2                 # quadratic
-        # p_mask = 1 - torch.cos((t.float()/T)*(pi/2))**2  # cosine
-        # p_mask = (exp(beta*(t.float()/T))-1)/(exp(beta)-1)  # exponential
-        p_mask = 1 - torch.cos((t.float() / T) * (math.pi/2))**2
-
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor):
+        p_mask = (t.float() + 1) / self.T
         rand = torch.rand_like(x_start.float(), device=self.device)
-        #print(rand.shape, p_mask.shape)
-        mask_indices = rand < p_mask#.unsqueeze(-1)  # broadcast over tokens
-        x_noisy = x_start.masked_fill(mask_indices, self.mask_id)
+        mask_indices = rand < p_mask
+        x_noisy = x_start.clone()
+        x_noisy[mask_indices] = self.mask_id
         return x_noisy, mask_indices
 
     def compute_loss(self, logits: torch.Tensor, target: torch.Tensor, mask_indices: torch.Tensor) -> torch.Tensor:
         vocab_size = logits.size(-1)
         loss_fct = nn.CrossEntropyLoss(reduction='none')
         logits_flat = logits.view(-1, vocab_size)
-        target_flat = target.reshape(-1)
+        target_flat = target.view(-1)
         losses = loss_fct(logits_flat, target_flat).view_as(target)
         masked = mask_indices.float()
         return (losses * masked).sum() / masked.sum().clamp(min=1)
- 
+    def compute_loss_adaptive(self,
+                              hidden_states: torch.Tensor,
+                              target: torch.Tensor) -> torch.Tensor:
+        """
+        hidden_states: (batch_size, seq_len, hidden_dim)
+        target:        (batch_size, seq_len), containing token IDs in [0, vocab_size)
+        """
+        # flatten batch & sequence dims
+       
+        batch_size, seq_len, h= hidden_states.size()
+        hidden_flat = hidden_states.view(-1, h)    # (B·S, H)
+        target_flat = target.view(-1)                            # (B·S,)
+        adaptive_softmax = nn.AdaptiveLogSoftmaxWithLoss(
+            in_features=h,
+            n_classes=self.vocab_size,
+            cutoffs=self.cutoffs,
+            div_value=4.0,
+            head_bias=True
+        )
+        # compute a boolean mask for positions where target == mask_id
+        mask_flat = (target_flat == self.mask_id)                # (B·S,)
+
+        # select only masked positions
+        masked_hidden = hidden_flat[mask_flat]
+        masked_target = target_flat[mask_flat]
+
+        # if there are no masked tokens, return zero loss
+        if masked_target.numel() == 0:
+            return torch.tensor(0., device=hidden_states.device)
+
+        # compute the adaptive softmax loss
+        out, loss = adaptive_softmax(masked_hidden, masked_target)
+        return loss
     def train(self, dataloader, batch_size: int = 32, epochs: int = 10, save_path: str = 'model'): 
         self.model.to(self.device)
         self.model.train()
@@ -792,14 +591,16 @@ class DiffusionTrainer2:
                 B, C, H, W = image_features.shape
                 image_features = image_features.reshape(B, C*H*W)#.permute(0, 2, 1) 
                 image_features = image_features.reshape(-1, 2*C*H*W)
+                #print(ima)
+                #image_features = image_features.unsqueeze(0)
+                #print("img", image_features.shape)
                 obs_features = torch.cat([image_features, gripper_state], dim=-1)
-                targ = self.tokenizer(target_states).to(self.device)
-                inputs = targ[:,:10]
+                inputs = self.tokenizer(target_states).to(self.device)
+
                 t = torch.randint(0, self.T, inputs.shape, device=self.device)
                 x_noisy, mask_indices = self.q_sample(inputs, t)
                 #print(x_noisy.shape, obs_features.shape)
                 logits = self.model['lldm'](x_noisy, obs_features)
-                #print(logits.shape, inputs.shape)
                 loss = self.compute_loss(logits, inputs, mask_indices)
 
                 if i % 10 == 0:
@@ -821,7 +622,7 @@ class DiffusionTrainer2:
             print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
 
             # Save both original and EMA models
-            #torch.save(self.model.state_dict(), f"{save_path}bias_epoch{epoch+1}.pt")
+            torch.save(self.model.state_dict(), f"{save_path}img_epoch{epoch+1}.pt")
             torch.save(ema.averaged_model.state_dict(), f"{save_path}img_ema_epoch{epoch+1}.pt")
 
         # Plot training loss
@@ -844,6 +645,6 @@ if  __name__== '__main__':
     print('loaded')
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
     tokeniser = TemporalBPEProcessor.load(tokeniser_path)
-    trainer = DiffusionTrainer2(tokeniser=tokeniser, vocab_size=vocab, device= 'cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = DiffusionTrainer2(tokeniser=tokeniser, vocab_size=500, device= 'cuda' if torch.cuda.is_available() else 'cpu')
     trainer.train(loader, batch_size=batch_size, epochs=epochs)
 
